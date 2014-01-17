@@ -21,10 +21,13 @@
 
 from __future__ import with_statement
 
+import pdb
+
 import logging
 import os
 import random
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -251,12 +254,37 @@ def update_instances(conn, nodes_list):
 # Wait for a set of launched instances to exit the "pending" state
 # (i.e. either to start running or to fail and be terminated)
 def wait_for_instances(conn, instances):
-    while True:
+    started_at = time.time()
+    ready = False
+    while not ready:
         instances = update_instances(conn, instances)
-        if len([i for i in instances if i.status == 'ACTIVE']) > 0:
-            time.sleep(5)
+        if len([i for i in instances if i.status == 'ACTIVE']) != len(instances):
+            time.sleep(3)
+            print ("Still waiting instances to become active, "
+                   + str(time.time() - started_at) + " seconds passed")
         else:
-            return
+            for i in instances:
+                if not "local" in i.addresses:
+                    print ("Still waiting instances to set up internal network, "
+                           + str(time.time() - started_at) + " seconds passed")
+                    ready = False
+                    time.sleep(3)
+                    break
+                else:
+                    ready = True
+    return
+
+
+# Checking ssh port before trying to connect
+def isPortOpened (ip, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(1)
+        s.connect((ip, int(port)))
+        s.close()
+        return True
+    except:
+        return False
 
 
 # Check whether an Openstack instance is not terminated. Openstack has more states than Amazon, so this place
@@ -482,6 +510,7 @@ def get_address_by_instance_object(conn, node, opts, internal=False):
         for float_address in conn.floating_ips.list():
             if float_address.instance_id is None:
                 node.add_floating_ip(address=float_address)
+#                time.sleep(5)
                 return float_address.ip
         #If we have no available floating addresses we need to allocate one
         addr_to_assign = conn.floating_ips.create(openstack_network_settings['floating_ips_pool_name'])
@@ -506,6 +535,30 @@ def setup_cluster(conn, master_nodes, slave_nodes, zoo_nodes, opts, deploy_ssh_k
     slave_nodes = update_instances(conn, slave_nodes)
     zoo_nodes = update_instances(conn, zoo_nodes)
     master = get_address_by_instance_object(conn=conn, node=master_nodes[0], opts=opts)
+    nodes_to_check = [master]
+    for slave in slave_nodes:
+        slave_address = get_address_by_instance_object(conn=conn, node=slave, opts=opts)
+        nodes_to_check.append(slave_address)
+
+    started_to_wait = time.time()
+
+    while not isPortOpened(master, 22):
+        print ("waiting for openssh-server to startup on the master-node for "
+               + str(time.time() - started_to_wait) + " seconds")
+        time.sleep(3)
+
+    print "checking other nodes"
+    everyone_booted = False
+    while not everyone_booted:
+        for node in nodes_to_check:
+            if not isPortOpened(node, 22):
+                print "not all the nodes are ready yet after " + str(time.time() - started_to_wait) + " seconds in total"
+                time.sleep(5)
+                continue
+        everyone_booted = True
+
+    print "all the nodes booted successfully in " + str(time.time() - started_to_wait)
+
     if deploy_ssh_key:
         print "Copying SSH key %s to master..." % opts.identity_file
         ssh(master, opts, 'mkdir -p ~/.ssh')
@@ -520,7 +573,7 @@ def setup_cluster(conn, master_nodes, slave_nodes, zoo_nodes, opts, deploy_ssh_k
     if opts.ganglia:
         modules.append('ganglia')
 #TODO: change it before pushes
-    ssh(master, opts, "git clone https://github.com/ispras/spark-openstack.git")
+    ssh(master, opts, "git clone https://github.com/al-indigo/spark-openstack.git")
 
     print "Deploying files to master..."
     deploy_files(conn, "deploy.generic", opts, master_nodes, slave_nodes,
@@ -558,14 +611,17 @@ def setup_spark_cluster(master, opts):
 
 # Wait for a whole cluster (masters, slaves and ZooKeeper) to start up
 def wait_for_cluster(conn, wait_secs, master_nodes, slave_nodes, zoo_nodes):
-    print "Waiting for instances to start up..."
     time.sleep(5)
+    print "Waiting for master to start up"
     wait_for_instances(conn, master_nodes)
+    print "Waiting for slaves to start up"
     wait_for_instances(conn, slave_nodes)
     if zoo_nodes != []:
+        print "Waiting for zoo-nodes to start up"
         wait_for_instances(conn, zoo_nodes)
-    print "Waiting %d more seconds..." % wait_secs
-    time.sleep(wait_secs)
+    print "Nodes started."
+#    print "Waiting %d more seconds..." % wait_secs
+#    time.sleep(wait_secs)
 
 
 # Deploy the configuration file templates in a given local directory to
@@ -691,17 +747,20 @@ def main():
         sys.exit(1)
 
     if action == "launch":
+        start_time = time.time()
         if opts.resume:
             (master_nodes, slave_nodes, zoo_nodes) = get_existing_cluster(
                 conn, opts, cluster_name)
         else:
             (master_nodes, slave_nodes, zoo_nodes) = launch_cluster(
                 conn, opts, cluster_name)
+#            pdb.set_trace()
             wait_for_cluster(conn, opts.wait, master_nodes, slave_nodes, zoo_nodes)
             master_nodes = update_instances(conn,master_nodes)
             slave_nodes = update_instances(conn,slave_nodes)
             zoo_nodes = update_instances(conn,zoo_nodes)
         setup_cluster(conn, master_nodes, slave_nodes, zoo_nodes, opts, True)
+        print "Cluster started in " + str(time.time() - start_time) + " seconds."
 
     elif action == "destroy":
         response = raw_input("Are you sure you want to destroy the cluster " +
